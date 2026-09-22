@@ -1,0 +1,111 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Employee {
+  id            String   @id @default(cuid())
+  employeeNumber String   @unique
+  fullName      String
+  role          String
+  department    String?
+  passwordHash  String?
+  refreshToken  String?
+  createdAt     DateTime @default(now())
+  leaves        LeaveRequest[]
+  approvals     Approval[]
+  balances      LeaveBalance[]
+}
+
+model LeaveType {
+  id          String @id @default(cuid())
+  code        String @unique
+  name        String
+  defaultDays Int    @default(0)
+  requests    LeaveRequest[]
+  balances    LeaveBalance[]
+}
+
+model LeaveBalance {
+  id         String   @id @default(cuid())
+  employeeId String
+  leaveTypeId String
+  year       Int
+  balance    Float    @default(0)
+  used       Float    @default(0)
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  leaveType  LeaveType @relation(fields: [leaveTypeId], references: [id])
+  @@unique([employeeId, leaveTypeId, year])
+}
+
+model LeaveRequest {
+  id          String   @id @default(cuid())
+  employeeId  String
+  leaveTypeId String
+  startDate   DateTime
+  endDate     DateTime
+  days        Float
+  isHalfDay   Boolean  @default(false)
+  reason      String?
+  status      LeaveStatus @default(PENDING)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  employee    Employee  @relation(fields: [employeeId], references: [id])
+  leaveType   LeaveType @relation(fields: [leaveTypeId], references: [id])
+  approvals   Approval[]
+}
+
+model Approval {
+  id             String   @id @default(cuid())
+  leaveRequestId String
+  approverId     String
+  decision       ApprovalDecision?
+  comment        String?
+  decidedAt      DateTime?
+  leaveRequest   LeaveRequest @relation(fields: [leaveRequestId], references: [id])
+  approver       Employee @relation(fields: [approverId], references: [id])
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum ApprovalDecision {
+  APPROVE
+  REJECT
+}
+
+model Holiday {
+  id   String @id @default(cuid())
+  date DateTime @db.Date
+  name String
+  @@unique([date])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String
+  entity    String
+  entityId  String?
+  userId    String?
+  details   Json?
+  createdAt DateTime @default(now())
+}
+
+model SyncLog {
+  id          String   @id @default(cuid())
+  direction   String   // INBOUND | OUTBOUND
+  source      String   // WEBHOOK | POLL
+  entity      String
+  entityId    String?
+  status      String   // SUCCESS | FAILED | PARTIAL
+  message     String?
+  createdAt   DateTime @default(now())
+}
