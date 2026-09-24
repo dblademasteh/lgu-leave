@@ -16,6 +16,11 @@ const createSchema = z.object({
 
 router.use(requireAuth);
 
+router.get('/types', async (req, res) => {
+  const types = await prisma.leaveType.findMany({ orderBy: { code: 'asc' } });
+  res.json(types);
+});
+
 router.get('/', async (req, res) => {
   const user = req.user;
   const where = user.role === 'ADMIN' || user.role === 'HR_MANAGER' ? {} : { employeeId: user.sub };
@@ -26,6 +31,27 @@ router.get('/', async (req, res) => {
   });
   res.json(leaves);
 });
+
+router.get('/balances', async (req, res) => {
+  const user = req.user;
+  const year = new Date().getFullYear();
+  const balances = await prisma.leaveBalance.findMany({
+    where: { employeeId: user.sub, year },
+    include: { leaveType: true },
+  });
+  res.json(balances.map(b => ({
+    leaveTypeCode: b.leaveType.code,
+    leaveTypeName: b.leaveType.name,
+    balance: b.balance,
+    used: b.used,
+    remaining: Math.max(0, b.balance - b.used)
+  })));
+});
+
+async function getSystemSettings() {
+  const rows = await prisma.systemSetting.findMany();
+  return Object.fromEntries(rows.map(r=>[r.key,r.value]));
+}
 
 router.post('/', async (req, res) => {
   const parse = createSchema.safeParse(req.body);
@@ -102,8 +128,31 @@ router.post('/', async (req, res) => {
 
   const created = await prisma.leaveRequest.findUnique({
     where: { id: reqRow.id },
-    include: { leaveType: true, approvals: { include: { approver: true } } }
+    include: { leaveType: true, approvals: { include: { approver: true } }, employee: true }
   });
+
+  // Outbound to HRMS on creation
+  (async () => {
+    try {
+      const settings = await getSystemSettings();
+      if (settings.HRMS_ENABLED==='true' && settings.HRMS_BASE_URL && settings.HRMS_API_KEY) {
+        await fetch(`${settings.HRMS_BASE_URL}/integrations/leaves/application`, {
+          method:'POST',
+          headers:{ 'x-api-key': settings.HRMS_API_KEY, 'Content-Type':'application/json' },
+          body: JSON.stringify({
+            employeeNumber: created.employee.employeeNumber,
+            leaveType: created.leaveType.code,
+            startDate: created.startDate.toISOString().slice(0,10),
+            endDate: created.endDate.toISOString().slice(0,10),
+            days: created.days,
+            status:'PENDING',
+            reason: created.reason
+          })
+        });
+      }
+    } catch(e){}
+  })();
+
   res.status(201).json(created);
 });
 
@@ -111,6 +160,34 @@ router.patch('/:id/status', async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
   const updated = await prisma.leaveRequest.update({ where: { id }, data: { status }});
+  res.json(updated);
+});
+
+router.patch('/:id', async (req, res) => {
+  const { id } = req.params;
+  const { startDate, endDate, reason, isHalfDay } = req.body;
+  const leave = await prisma.leaveRequest.findUnique({ where: { id } });
+  if (!leave) return res.status(404).json({ error: 'Not found' });
+  if (leave.status !== 'PENDING') return res.status(400).json({ error: 'Can only edit pending requests' });
+  if (leave.employeeId !== req.user.sub && !['ADMIN','HR_MANAGER'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const updated = await prisma.leaveRequest.update({
+    where: { id },
+    data: { startDate: startDate ? new Date(startDate) : undefined, endDate: endDate ? new Date(endDate) : undefined, reason, isHalfDay }
+  });
+  res.json(updated);
+});
+
+router.post('/:id/cancel', async (req, res) => {
+  const { id } = req.params;
+  const leave = await prisma.leaveRequest.findUnique({ where: { id } });
+  if (!leave) return res.status(404).json({ error: 'Not found' });
+  if (leave.status !== 'PENDING') return res.status(400).json({ error: 'Can only cancel pending requests' });
+  if (leave.employeeId !== req.user.sub && !['ADMIN','HR_MANAGER'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const updated = await prisma.leaveRequest.update({ where: { id }, data: { status: 'CANCELLED' } });
   res.json(updated);
 });
 
@@ -158,29 +235,31 @@ router.post('/:id/approve', async (req, res) => {
       data: { used: { increment: leave.days } }
     });
 
-    // Outbound HRMS sync fire-and-forget
-    const hrmsBase = process.env.HRMS_BASE_URL;
-    if (hrmsBase) {
-      (async () => {
-        try {
-          const payload = {
-            employeeNumber: (await prisma.employee.findUnique({ where: { id: leave.employeeId } }))?.employeeNumber,
-            leaveType: (await prisma.leaveType.findUnique({ where: { id: leave.leaveTypeId } }))?.code,
-            startDate: leave.startDate.toISOString().slice(0,10),
-            endDate: leave.endDate.toISOString().slice(0,10),
-            days: leave.days
-          };
-          await fetch(`${hrmsBase}/integrations/attendance/leave`, {
-            method: 'POST',
-            headers: { 'x-api-key': process.env.HRMS_API_KEY || '', 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+    // Outbound to Attendance system on approval
+    (async () => {
+      try {
+        const settings = await getSystemSettings();
+        if (settings.ATTENDANCE_ENABLED==='true' && settings.ATTENDANCE_WEBHOOK_URL) {
+          const emp = await prisma.employee.findUnique({ where:{ id: leave.employeeId }});
+          const lt = await prisma.leaveType.findUnique({ where:{ id: leave.leaveTypeId }});
+          await fetch(settings.ATTENDANCE_WEBHOOK_URL, {
+            method:'POST',
+            headers:{ 'Content-Type':'application/json' },
+            body: JSON.stringify({
+              employeeNumber: emp?.employeeNumber,
+              leaveType: lt?.code,
+              startDate: leave.startDate.toISOString().slice(0,10),
+              endDate: leave.endDate.toISOString().slice(0,10),
+              days: leave.days,
+              status:'APPROVED'
+            })
           });
           await prisma.syncLog.create({ data: { direction: 'OUTBOUND', source: 'API', entity: 'LeaveRequest', entityId: id, status: 'SUCCESS' } });
-        } catch (e) {
-          await prisma.syncLog.create({ data: { direction: 'OUTBOUND', source: 'API', entity: 'LeaveRequest', entityId: id, status: 'FAILED', message: String(e) } });
         }
-      })();
-    }
+      } catch(e) {
+        await prisma.syncLog.create({ data: { direction: 'OUTBOUND', source: 'API', entity: 'LeaveRequest', entityId: id, status: 'FAILED', message: String(e) } });
+      }
+    })();
   }
 
   res.json({ ok: true, status: newStatus });

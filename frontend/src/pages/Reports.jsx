@@ -10,9 +10,16 @@ export default function Reports(){
     api.get('/api/v1/leaves').then(r=>setLeaves(Array.isArray(r.data)?r.data:[])).catch(()=>setLeaves([])).finally(()=>setLoading(false));
   },[]);
   const totals = leaves.reduce((acc,l)=>{ acc[l.status]=(acc[l.status]||0)+1; return acc; },{});
+  const exportCSC = () => {
+    const year = new Date().getFullYear();
+    window.open(`http://localhost:4200/api/v1/reports/csc?year=${year}`, '_blank');
+  };
   return (
     <div className="p-6 max-w-6xl mx-auto space-y-6">
-      <h1 className="font-display text-2xl flex items-center gap-2"><BarChart3 size={22}/>Reports</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="font-display text-2xl flex items-center gap-2"><BarChart3 size={22}/>Reports</h1>
+        <button className="btn btn-outline" onClick={exportCSC}>Export CSC Leave Monitoring</button>
+      </div>
       {loading ? <div className="grid grid-cols-3 gap-4 animate-pulse"><div className="h-24 bg-bg rounded"/><div className="h-24 bg-bg rounded"/><div className="h-24 bg-bg rounded"/></div> : (
         <>
           <div className="grid grid-cols-3 gap-4">
